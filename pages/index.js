@@ -10,7 +10,7 @@ export default function Home() {
     setError(null);
     setResult(null);
     try {
-      const res = await fetch('/api/analyse?secret=niklas2026');
+      const res = await fetch('/api/analyse?secret=megahemmeligt');
       const data = await res.json();
       setResult(data);
     } catch (e) {
