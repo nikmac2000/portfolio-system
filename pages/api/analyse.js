@@ -1,12 +1,8 @@
-// pages/api/analyse.js — OPDATERET
-// Daglige alerts ved gode signaler + nye diversitetskøb
+// pages/api/analyse.js — sender ALTID mail når der køres analyse
 
 import Anthropic from '@anthropic-ai/sdk';
-import {
-  HOLDINGS, SHIFTS, parseHours,
-  fetchYahooHistory, technicalSignal
-} from '../../lib/analysis';
-import { buildEmailHTML, sendEmail } from '../../lib/email';
+import { SHIFTS, parseHours, fetchYahooHistory, technicalSignal } from '../../lib/analysis';
+import { sendEmail } from '../../lib/email';
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -42,6 +38,7 @@ const WATCHLIST = [
   { name: 'A.P. Møller-Mærsk B', ticker: 'MAERSK-B.CO', sector: 'Transport' },
 ];
 
+const GOLD_GRAMS = 7.5 + 31.1035 / 20;
 const FX = { USD: 6.85, EUR: 7.46, SEK: 0.645, NOK: 0.625, GBP: 8.6, DKK: 1 };
 function toDKK(price, currency) { return price * (FX[currency] || 1); }
 
@@ -58,10 +55,24 @@ async function getMacro() {
   } catch { return null; }
 }
 
+async function getGoldPrice() {
+  try {
+    const url = 'https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF?interval=1d&range=2d';
+    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const data = await r.json();
+    const meta = data?.chart?.result?.[0]?.meta;
+    if (!meta) return null;
+    const pricePerGram = (meta.regularMarketPrice / 31.1035) * FX.USD;
+    const prevPerGram = (meta.previousClose / 31.1035) * FX.USD;
+    const dayChg = ((pricePerGram - prevPerGram) / prevPerGram * 100);
+    const totalValue = pricePerGram * GOLD_GRAMS;
+    return { pricePerGram, dayChg, totalValue };
+  } catch { return null; }
+}
+
 async function findNewCandidates(availableCash, ownedSectors) {
   const overweight = ['Forsvar'];
   const candidates = [];
-
   for (const stock of WATCHLIST) {
     try {
       const data = await fetchYahooHistory(stock.ticker);
@@ -69,30 +80,24 @@ async function findNewCandidates(availableCash, ownedSectors) {
       const price = data.meta.regularMarketPrice;
       const currency = data.meta.currency;
       const priceDKK = toDKK(price, currency);
-
-      // Tjek råd til mindst 1 aktie
       if (priceDKK > availableCash) continue;
-      // Tjek kurtage ikke æder for meget (under 2%)
       const kurtageEats = (39 / priceDKK) * 100;
       if (kurtageEats > 2) continue;
-
       const sig = technicalSignal(data.closes, price);
       if (sig.signal !== 'KØB') continue;
-
       let adjustedScore = sig.score;
       if (overweight.includes(stock.sector)) adjustedScore -= 1;
       if (!ownedSectors.includes(stock.sector)) adjustedScore += 1;
-
       candidates.push({ ...stock, price, priceDKK, currency, kurtageEats: kurtageEats.toFixed(2), ...sig, adjustedScore });
     } catch { continue; }
   }
-
   return candidates.sort((a, b) => b.adjustedScore - a.adjustedScore).slice(0, 4);
 }
 
-function buildEmail({ macro, newCandidates, ownedSignals, cash, availableToInvest, dateStr }) {
+function buildEmail({ macro, newCandidates, ownedSignals, cash, availableToInvest, dateStr, gold }) {
   const buyOwned = ownedSignals.filter(r => r.signal === 'KØB');
   const sellOwned = ownedSignals.filter(r => r.signal === 'SÆLG');
+  const holdOwned = ownedSignals.filter(r => r.signal === 'HOLD');
 
   const candidateHTML = newCandidates.map(c => `
     <div style="padding:14px;border:1px solid #e8e8e8;border-radius:10px;margin-bottom:10px;border-left:4px solid #1D9E75">
@@ -106,27 +111,41 @@ function buildEmail({ macro, newCandidates, ownedSignals, cash, availableToInves
       <div style="margin-top:5px;font-size:12px;color:#666">${c.reasons?.slice(0, 2).join(' · ')}</div>
     </div>`).join('');
 
-  const buyOwnedHTML = buyOwned.map(r => `
-    <div style="padding:10px 14px;border-bottom:1px solid #f0f0f0">
-      <strong>${r.name}</strong> <span style="color:#888;font-size:12px">RSI ${r.rsi?.toFixed(0)} · ${r.reasons?.[0] || ''}</span>
-    </div>`).join('');
+  const allOwnedRows = ownedSignals.map(r => {
+    const sigColor = r.signal === 'KØB' ? '#1D9E75' : r.signal === 'SÆLG' ? '#D85A30' : '#888';
+    const sigEmoji = r.signal === 'KØB' ? '🟢' : r.signal === 'SÆLG' ? '🔴' : '🟡';
+    return `<tr style="border-bottom:1px solid #f5f5f5">
+      <td style="padding:8px 12px;font-weight:500">${r.name}</td>
+      <td style="padding:8px 12px;color:#888;font-size:12px">${r.ticker}</td>
+      <td style="padding:8px 12px;color:${r.dayChg >= 0 ? '#1D9E75' : '#D85A30'}">${r.dayChg >= 0 ? '+' : ''}${r.dayChg?.toFixed(2)}%</td>
+      <td style="padding:8px 12px">${r.rsi?.toFixed(0) || '—'}</td>
+      <td style="padding:8px 12px;color:${sigColor};font-weight:600">${sigEmoji} ${r.signal}</td>
+    </tr>`;
+  }).join('');
 
-  const sellOwnedHTML = sellOwned.map(r => `
-    <div style="padding:10px 14px;border-bottom:1px solid #f0f0f0">
-      <strong>${r.name}</strong> <span style="color:#888;font-size:12px">RSI ${r.rsi?.toFixed(0)} · ${r.reasons?.[0] || ''}</span>
-    </div>`).join('');
+  const goldHTML = gold ? `
+    <div class="card">
+      <h2>🥇 Guld</h2>
+      <div style="font-size:13px;color:#444;line-height:1.8">
+        Pris per gram: <strong>${Math.round(gold.pricePerGram).toLocaleString('da-DK')} kr</strong>
+        <span style="color:${gold.dayChg >= 0 ? '#1D9E75' : '#D85A30'};margin-left:8px">${gold.dayChg >= 0 ? '+' : ''}${gold.dayChg.toFixed(2)}% i dag</span><br>
+        Din beholdning (${GOLD_GRAMS.toFixed(3)} g): <strong>${Math.round(gold.totalValue).toLocaleString('da-DK')} kr</strong>
+      </div>
+    </div>` : '';
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
     body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;color:#1a1a1a;max-width:620px;margin:0 auto;padding:20px;background:#f7f7f7}
     .card{background:white;border-radius:12px;padding:20px 24px;margin-bottom:14px;border:1px solid #eee}
     h2{font-size:16px;margin:0 0 14px}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th{text-align:left;padding:8px 12px;background:#f5f5f5;font-size:12px;color:#666}
     .footer{font-size:11px;color:#bbb;text-align:center;margin-top:20px;line-height:1.8}
   </style></head><body>
 
   <div class="card">
     <div style="font-size:12px;color:#888;margin-bottom:4px">${dateStr}</div>
     <div style="font-size:22px;font-weight:700;margin-bottom:6px">📊 Porteføljeanalyse</div>
-    <div style="font-size:13px;color:#555">${newCandidates.length} nye muligheder · ${buyOwned.length} køb · ${sellOwned.length} sælg</div>
+    <div style="font-size:13px;color:#555">${newCandidates.length} nye muligheder · ${buyOwned.length} køb · ${sellOwned.length} sælg · ${holdOwned.length} hold</div>
   </div>
 
   <div class="card">
@@ -141,19 +160,21 @@ function buildEmail({ macro, newCandidates, ownedSignals, cash, availableToInves
     <h2>✨ Nye købsmuligheder</h2>
     <p style="font-size:12px;color:#888;margin:-6px 0 14px">Passer til dine kontanter · kurtage under 2% · god teknisk analyse</p>
     ${candidateHTML}
-  </div>` : ''}
+  </div>` : '<div class="card"><h2>✨ Nye købsmuligheder</h2><p style="font-size:13px;color:#888;margin:0">Ingen nye aktier opfylder kriterierne i dag.</p></div>'}
 
-  ${buyOwned.length ? `<div class="card" style="border-left:4px solid #1D9E75">
-    <h2>🟢 Køb-signaler i din portefølje</h2>${buyOwnedHTML}
-  </div>` : ''}
+  <div class="card">
+    <h2>📋 Din portefølje</h2>
+    <table>
+      <tr><th>Aktie</th><th>Ticker</th><th>I dag</th><th>RSI</th><th>Signal</th></tr>
+      ${allOwnedRows}
+    </table>
+  </div>
 
-  ${sellOwned.length ? `<div class="card" style="border-left:4px solid #D85A30">
-    <h2>🔴 Sælg-signaler i din portefølje</h2>${sellOwnedHTML}
-  </div>` : ''}
+  ${goldHTML}
 
   <div class="footer">
     Automatisk teknisk analyse · Ikke finansiel rådgivning<br>
-    Nordnets minimumskurtage: 39 kr
+    Nordnets minimumskurtage: 39 kr · Nordisk Guldss salær: 0,5%
   </div>
   </body></html>`;
 }
@@ -188,30 +209,28 @@ export default async function handler(req, res) {
     const ownedSectors = [...new Set(OWNED_STOCKS.map(s => s.sector))];
     const newCandidates = await findNewCandidates(availableToInvest, ownedSectors);
 
-    // 3. Makro
-    const macro = await getMacro();
+    // 3. Guld og makro
+    const [gold, macro] = await Promise.all([getGoldPrice(), getMacro()]);
 
-    // 4. Send email hvis der er noget
+    // 4. Byg emne
     const hasBuy = ownedSignals.some(r => r.signal === 'KØB');
     const hasSell = ownedSignals.some(r => r.signal === 'SÆLG');
-    const hasAnything = hasBuy || hasSell || newCandidates.length > 0;
+    const dateStr = new Date().toLocaleDateString('da-DK', { weekday: 'long', day: 'numeric', month: 'long' });
 
-    if (hasAnything) {
-      const dateStr = new Date().toLocaleDateString('da-DK', { weekday: 'long', day: 'numeric', month: 'long' });
-      const subject = newCandidates.length
-        ? `📊 ${newCandidates.length} nye aktier at kigge på — ${newCandidates.map(c => c.name).join(', ')}`
-        : `📊 ${hasBuy ? '🟢 Køb' : ''}${hasSell ? ' 🔴 Sælg' : ''} signal i din portefølje`;
+    const subject = newCandidates.length
+      ? `📊 ${newCandidates.length} nye aktier — ${newCandidates.map(c => c.name).join(', ')}`
+      : hasBuy || hasSell
+        ? `📊 ${hasBuy ? '🟢 Køb' : ''}${hasSell ? ' 🔴 Sælg' : ''} signal — ${dateStr}`
+        : `📊 Porteføljeanalyse ${dateStr} — ingen stærke signaler`;
 
-      const html = buildEmail({ macro, newCandidates, ownedSignals, cash, availableToInvest, dateStr });
-      await sendEmail({ subject, html, to: process.env.ALERT_EMAIL });
-      console.log('✅ Email sendt');
-    } else {
-      console.log('😴 Ingen signaler — ingen email');
-    }
+    // 5. Send ALTID email
+    const html = buildEmail({ macro, newCandidates, ownedSignals, cash, availableToInvest, dateStr, gold });
+    await sendEmail({ subject, html, to: process.env.ALERT_EMAIL });
+    console.log('✅ Email sendt:', subject);
 
     return res.status(200).json({
       ok: true,
-      emailSent: hasAnything,
+      emailSent: true,
       newCandidates: newCandidates.map(c => c.name),
       buySignals: ownedSignals.filter(r => r.signal === 'KØB').map(r => r.name),
       sellSignals: ownedSignals.filter(r => r.signal === 'SÆLG').map(r => r.name),
